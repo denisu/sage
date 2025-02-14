@@ -44,17 +44,16 @@ impl Sage {
 
     pub async fn bulk_send_xch(&self, req: BulkSendXch) -> Result<TransactionResponse> {
         let wallet = self.wallet()?;
+        let mut amounts = Vec::with_capacity(req.transfers.len());
 
-        let amount = self.parse_amount(req.amount)?;
-
-        let mut amounts = Vec::with_capacity(req.addresses.len());
-
-        for address in req.addresses {
-            amounts.push((self.parse_address(address)?, amount));
+        for transfer in &req.transfers {
+            amounts.push((
+                self.parse_address(transfer.address.clone())?,
+                self.parse_amount(transfer.amount.clone())?,
+            ));
         }
 
         let fee = self.parse_amount(req.fee)?;
-
         let mut memos = Vec::new();
 
         for memo in req.memos {
@@ -156,17 +155,16 @@ impl Sage {
     pub async fn bulk_send_cat(&self, req: BulkSendCat) -> Result<TransactionResponse> {
         let wallet = self.wallet()?;
         let asset_id = parse_asset_id(req.asset_id)?;
+        let mut amounts = Vec::with_capacity(req.transfers.len());
 
-        let amount = parse_cat_amount(req.amount)?;
-
-        let mut amounts = Vec::with_capacity(req.addresses.len());
-
-        for address in req.addresses {
-            amounts.push((self.parse_address(address)?, amount));
+        for transfer in &req.transfers {
+            amounts.push((
+                self.parse_address(transfer.address.clone())?,
+                parse_cat_amount(transfer.amount.clone())?,
+            ));
         }
 
         let fee = self.parse_amount(req.fee)?;
-
         let mut memos = Vec::new();
 
         for memo in req.memos {

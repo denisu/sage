@@ -16,9 +16,15 @@ pub struct SendXch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "tauri", derive(specta::Type))]
-pub struct BulkSendXch {
-    pub addresses: Vec<String>,
+pub struct Transfer {
+    pub address: String,
     pub amount: Amount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct BulkSendXch {
+    pub transfers: Vec<Transfer>,
     pub fee: Amount,
     #[serde(default)]
     pub memos: Vec<String>,
@@ -92,8 +98,7 @@ pub struct SendCat {
 #[cfg_attr(feature = "tauri", derive(specta::Type))]
 pub struct BulkSendCat {
     pub asset_id: String,
-    pub addresses: Vec<String>,
-    pub amount: Amount,
+    pub transfers: Vec<Transfer>,
     pub fee: Amount,
     #[serde(default)]
     pub memos: Vec<String>,
