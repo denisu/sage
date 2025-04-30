@@ -1,7 +1,6 @@
-use std::cmp::Reverse;
-
 use chia::protocol::{Bytes32, CoinState};
 use sqlx::SqliteExecutor;
+use sqlx::{sqlite::SqliteRow, Row};
 
 use crate::{
     into_row, to_bytes32, CoinKind, CoinStateRow, CoinStateSql, Database, DatabaseTx, IntoRow,
@@ -58,8 +57,14 @@ impl Database {
         is_coin_locked(&self.pool, coin_id).await
     }
 
-    pub async fn get_block_heights(&self) -> Result<Vec<u32>> {
-        get_block_heights(&self.pool).await
+    pub async fn get_transaction_coins(
+        &self,
+        offset: u32,
+        limit: u32,
+        asc: bool,
+        find_value: Option<String>,
+    ) -> Result<(Vec<SqliteRow>, u32)> {
+        get_transaction_coins(&self.pool, offset, limit, asc, find_value).await
     }
 
     pub async fn get_coin_states_by_created_height(
@@ -72,9 +77,13 @@ impl Database {
     pub async fn get_coin_states_by_spent_height(&self, height: u32) -> Result<Vec<CoinStateRow>> {
         get_coin_states_by_spent_height(&self.pool, height).await
     }
+
+    pub async fn get_are_coins_spendable(&self, coin_ids: &[String]) -> Result<bool> {
+        get_are_coins_spendable(&self.pool, coin_ids).await
+    }
 }
 
-impl<'a> DatabaseTx<'a> {
+impl DatabaseTx<'_> {
     pub async fn insert_coin_state(
         &mut self,
         coin_state: CoinState,
@@ -213,7 +222,7 @@ async fn unsynced_coin_states(
     let rows = sqlx::query_as!(
         CoinStateSql,
         "
-        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`
+        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`, `created_unixtime`, `spent_unixtime`
         FROM `coin_states`
         WHERE `synced` = 0 AND `created_height` IS NOT NULL
         ORDER BY `spent_height` ASC
@@ -311,7 +320,7 @@ async fn coin_state(conn: impl SqliteExecutor<'_>, coin_id: Bytes32) -> Result<O
     let Some(sql) = sqlx::query_as!(
         CoinStateSql,
         "
-        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`
+        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`, `created_unixtime`, `spent_unixtime`
         FROM `coin_states`
         WHERE `coin_id` = ?
         ",
@@ -417,33 +426,174 @@ async fn is_coin_locked(conn: impl SqliteExecutor<'_>, coin_id: Bytes32) -> Resu
     Ok(row.count > 0)
 }
 
-async fn get_block_heights(conn: impl SqliteExecutor<'_>) -> Result<Vec<u32>> {
-    let rows = sqlx::query!(
+async fn get_transaction_coins(
+    conn: impl SqliteExecutor<'_>,
+    offset: u32,
+    limit: u32,
+    asc: bool,
+    find_value: Option<String>,
+) -> Result<(Vec<SqliteRow>, u32)> {
+    let mut query = sqlx::QueryBuilder::new(
         "
-        SELECT DISTINCT height FROM (
-            SELECT created_height as height FROM coin_states INDEXED BY `coin_created`
-            WHERE created_height IS NOT NULL
+        WITH coin_states_with_heights AS (
+            SELECT 
+                cs.coin_id,
+                cs.created_height as height
+            FROM coin_states cs
+            WHERE cs.created_height IS NOT NULL
+            
             UNION ALL
-            SELECT spent_height as height FROM coin_states INDEXED BY `coin_spent`
-            WHERE spent_height IS NOT NULL
-        )
-        GROUP BY height
-        "
-    )
-    .fetch_all(conn)
-    .await?;
+            
+            SELECT 
+                cs.coin_id,
+                cs.spent_height as height
+            FROM coin_states cs
+            WHERE cs.spent_height IS NOT NULL
+        ),
+        joined_coin_states AS (
+            SELECT 
+                DISTINCT h.height
+            FROM coin_states_with_heights h
+                LEFT JOIN cat_coins ON h.coin_id = cat_coins.coin_id
+                LEFT JOIN cats ON cat_coins.asset_id = cats.asset_id
+                LEFT JOIN did_coins ON h.coin_id = did_coins.coin_id
+                LEFT JOIN dids ON did_coins.coin_id = dids.coin_id
+                LEFT JOIN nft_coins ON h.coin_id = nft_coins.coin_id
+                LEFT JOIN nfts ON nft_coins.coin_id = nfts.coin_id
+            WHERE 1=1
+        ",
+    );
 
-    let mut heights = Vec::with_capacity(rows.len());
+    if let Some(value) = &find_value {
+        // Check if searching for XCH (matches "x", "xc", or "xch")
+        let should_filter_xch = if value.len() <= 3 {
+            let value_lower = value.to_lowercase();
+            value_lower == "x" || value_lower == "xc" || value_lower == "xch"
+        } else {
+            false
+        };
 
-    for row in rows {
-        if let Some(height) = row.height {
-            heights.push(height.try_into()?);
+        query.push(" AND (");
+
+        if should_filter_xch {
+            // XCH coins have kind = 1 (standard P2 coins)
+            query.push("kind = 1 OR ");
         }
+
+        if is_valid_asset_id(value) {
+            query.push("cats.asset_id = X'").push(value).push("' OR ");
+        } else if is_valid_address(value, "nft") {
+            if let Some(puzzle_hash) = puzzle_hash_from_address(value) {
+                query
+                    .push("nfts.launcher_id = X'")
+                    .push(puzzle_hash)
+                    .push("' OR ");
+            }
+        } else if is_valid_address(value, "did:chia:") {
+            if let Some(puzzle_hash) = puzzle_hash_from_address(value) {
+                query
+                    .push("dids.launcher_id = X'")
+                    .push(puzzle_hash)
+                    .push("' OR ");
+            }
+        }
+
+        if is_valid_height(value) {
+            query.push("height = ").push(value).push(" OR ");
+        }
+
+        query
+            .push("ticker LIKE ")
+            .push_bind(format!("%{value}%"))
+            .push(" OR cats.name LIKE ")
+            .push_bind(format!("%{value}%"))
+            .push(" OR dids.name LIKE ")
+            .push_bind(format!("%{value}%"))
+            .push(" OR nfts.name LIKE ")
+            .push_bind(format!("%{value}%"))
+            .push(")");
     }
+    query.push(
+        "
+        ),
+        paged_heights AS (
+            SELECT 
+                height,
+                COUNT(*) OVER() as total_count
+            FROM joined_coin_states
+            ORDER BY height ",
+    );
+    query.push(if asc { "ASC" } else { "DESC" });
+    query.push(" LIMIT ? OFFSET ? )");
 
-    heights.sort_by_key(|height| Reverse(*height));
+    query.push("
+        SELECT 
+            paged_heights.total_count,
+            'created' AS action_type,
+            cs.created_height AS height,
+            created_unixtime AS unixtime, 
+            cs.coin_id,  
+            cs.kind, 
+            amount,
+            COALESCE (cat_coins.p2_puzzle_hash, did_coins.p2_puzzle_hash, nft_coins.p2_puzzle_hash, puzzle_hash) AS p2_puzzle_hash,
+            COALESCE (cats.name, nfts.name, dids.name, NULL) AS name,
+            COALESCE (cats.asset_id, nfts.launcher_id, dids.launcher_id, NULL) AS item_id,
+            nft_coins.metadata AS nft_metadata,
+            cats.ticker,
+            cats.icon AS cat_icon_url,
+            nft_thumbnails.icon AS nft_icon,
+            (SELECT COUNT(*)
+                FROM derivations d 
+                WHERE d.p2_puzzle_hash = COALESCE(cat_coins.p2_puzzle_hash, did_coins.p2_puzzle_hash, nft_coins.p2_puzzle_hash, cs.puzzle_hash)) AS derivation_count
+        FROM coin_states cs
+            INNER JOIN paged_heights ON cs.created_height = paged_heights.height
+            LEFT JOIN cat_coins ON cs.coin_id = cat_coins.coin_id
+            LEFT JOIN cats ON cat_coins.asset_id = cats.asset_id
+            LEFT JOIN did_coins ON cs.coin_id = did_coins.coin_id
+            LEFT JOIN dids ON did_coins.coin_id = dids.coin_id
+            LEFT JOIN nft_coins ON cs.coin_id = nft_coins.coin_id
+            LEFT JOIN nfts ON nft_coins.coin_id = nfts.coin_id
+	        LEFT JOIN nft_thumbnails ON nft_coins.data_hash = nft_thumbnails.hash
 
-    Ok(heights)
+        UNION ALL 
+
+        SELECT 
+            paged_heights.total_count,
+            'spent' AS action_type,
+            cs.spent_height AS height,
+            spent_unixtime AS unixtime, 
+            cs.coin_id,  
+            cs.kind, 
+            amount,
+            COALESCE (cat_coins.p2_puzzle_hash, did_coins.p2_puzzle_hash, nft_coins.p2_puzzle_hash, puzzle_hash) AS p2_puzzle_hash,
+            COALESCE (cats.name, nfts.name, dids.name, NULL) AS name,
+            COALESCE (cats.asset_id, nfts.launcher_id, dids.launcher_id, NULL) AS item_id,
+            nft_coins.metadata AS nft_metadata,
+            cats.ticker,
+            cats.icon AS cat_icon_url,
+            nft_thumbnails.icon AS nft_icon,
+            (SELECT COUNT(*)
+                FROM derivations d 
+                WHERE d.p2_puzzle_hash = COALESCE(cat_coins.p2_puzzle_hash, did_coins.p2_puzzle_hash, nft_coins.p2_puzzle_hash, cs.puzzle_hash)) AS derivation_count
+        FROM coin_states cs
+            INNER JOIN paged_heights ON cs.spent_height = paged_heights.height
+            LEFT JOIN cat_coins ON cs.coin_id = cat_coins.coin_id
+            LEFT JOIN cats ON cat_coins.asset_id = cats.asset_id
+            LEFT JOIN did_coins ON cs.coin_id = did_coins.coin_id
+            LEFT JOIN dids ON did_coins.coin_id = dids.coin_id
+            LEFT JOIN nft_coins ON cs.coin_id = nft_coins.coin_id
+            LEFT JOIN nfts ON nft_coins.coin_id = nfts.coin_id
+            LEFT JOIN nft_thumbnails ON nft_coins.data_hash = nft_thumbnails.hash");
+    let built_query = query.build();
+    let rows = built_query.bind(limit).bind(offset).fetch_all(conn).await?;
+
+    let Some(first_row) = rows.first() else {
+        return Ok((vec![], 0));
+    };
+
+    let total: u32 = first_row.try_get("total_count")?;
+
+    Ok((rows, total))
 }
 
 async fn get_coin_states_by_created_height(
@@ -453,7 +603,7 @@ async fn get_coin_states_by_created_height(
     let rows = sqlx::query_as!(
         CoinStateSql,
         "
-        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`
+        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`, `created_unixtime`, `spent_unixtime`
         FROM `coin_states` INDEXED BY `coin_created`
         WHERE `created_height` = ?
         ",
@@ -472,7 +622,7 @@ async fn get_coin_states_by_spent_height(
     let rows = sqlx::query_as!(
         CoinStateSql,
         "
-        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`
+        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`, `created_unixtime`, `spent_unixtime`
         FROM `coin_states` INDEXED BY `coin_spent`
         WHERE `spent_height` = ?
         ",
@@ -493,7 +643,7 @@ async fn full_coin_state(
     let Some(sql) = sqlx::query_as!(
         CoinStateSql,
         "
-        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`
+        SELECT `parent_coin_id`, `puzzle_hash`, `amount`, `created_height`, `spent_height`, `transaction_id`, `kind`, `created_unixtime`, `spent_unixtime`
         FROM `coin_states` WHERE `coin_id` = ?
         ",
         coin_id
@@ -505,4 +655,64 @@ async fn full_coin_state(
     };
 
     Ok(Some(sql.into_row()?))
+}
+
+/// Checks if the provided string is a valid asset ID (64 character hex string)
+pub fn is_valid_asset_id(asset_id: &str) -> bool {
+    asset_id.len() == 64 && asset_id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Checks if a given address is valid for the specified prefix
+pub fn is_valid_address(address: &str, prefix: &str) -> bool {
+    if let Ok(decoded) = chia_wallet_sdk::utils::Address::decode(address) {
+        // Check if the prefix matches and the puzzle hash is valid (32 bytes)
+        decoded.prefix == prefix && decoded.puzzle_hash.as_ref().len() == 32
+    } else {
+        false
+    }
+}
+
+/// Extracts puzzle hash from an address
+fn puzzle_hash_from_address(address: &str) -> Option<String> {
+    chia_wallet_sdk::utils::Address::decode(address)
+        .map(|decoded| hex::encode(decoded.puzzle_hash.as_ref()))
+        .ok()
+}
+
+/// Checks if a string is a valid block height (non-negative integer)
+pub fn is_valid_height(height_str: &str) -> bool {
+    height_str.parse::<u32>().is_ok()
+}
+
+async fn get_are_coins_spendable(
+    conn: impl SqliteExecutor<'_>,
+    coin_ids: &[String],
+) -> Result<bool> {
+    if coin_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let mut query = sqlx::QueryBuilder::new(
+        "
+        SELECT COUNT(*)
+        FROM coin_states
+        LEFT JOIN transaction_spends ON transaction_spends.coin_id = coin_states.coin_id
+        WHERE 1=1 
+        AND created_height IS NOT NULL
+        AND spent_height IS NULL
+        AND coin_states.transaction_id IS NULL
+        AND transaction_spends.coin_id IS NULL
+        AND coin_states.coin_id IN (",
+    );
+
+    let mut separated = query.separated(", ");
+    for coin_id in coin_ids {
+        separated.push(format!("X'{coin_id}'"));
+    }
+    separated.push_unseparated(")");
+
+    let count: i64 = query.build().fetch_one(conn).await?.get(0);
+
+    #[allow(clippy::cast_possible_wrap)]
+    Ok(count == coin_ids.len() as i64)
 }

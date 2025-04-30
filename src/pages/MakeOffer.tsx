@@ -1,4 +1,4 @@
-import { Assets, commands, NetworkConfig } from '@/bindings';
+import { Assets, commands, NetworkKind } from '@/bindings';
 import Container from '@/components/Container';
 import { CopyBox } from '@/components/CopyBox';
 import Header from '@/components/Header';
@@ -16,16 +16,26 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { TokenAmountInput } from '@/components/ui/masked-input';
+import { IntegerInput, TokenAmountInput } from '@/components/ui/masked-input';
 import { Switch } from '@/components/ui/switch';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+import { useDefaultOfferExpiry } from '@/hooks/useDefaultOfferExpiry';
 import { useErrors } from '@/hooks/useErrors';
+import useOfferStateWithDefault from '@/hooks/useOfferStateWithDefault';
+import { usePrices } from '@/hooks/usePrices';
 import { uploadToDexie, uploadToMintGarden } from '@/lib/offerUpload';
 import { toMojos } from '@/lib/utils';
-import { clearOffer, useOfferState, useWalletState } from '@/state';
+import { useWalletState } from '@/state';
 import { t } from '@lingui/core/macro';
 import { Trans } from '@lingui/react/macro';
-import { open } from '@tauri-apps/plugin-shell';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import {
+  ArrowUpToLine,
   HandCoins,
   Handshake,
   ImageIcon,
@@ -35,9 +45,13 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { CatRecord } from '../bindings';
 
 export function MakeOffer() {
-  const state = useOfferState();
+  const [state, setState] = useOfferStateWithDefault();
+
+  const { expiry } = useDefaultOfferExpiry();
+
   const walletState = useWalletState();
   const navigate = useNavigate();
 
@@ -48,12 +62,10 @@ export function MakeOffer() {
   const [dexieLink, setDexieLink] = useState('');
   const [mintGardenLink, setMintGardenLink] = useState('');
   const [canUploadToMintGarden, setCanUploadToMintGarden] = useState(false);
-
-  const [config, setConfig] = useState<NetworkConfig | null>(null);
-  const network = config?.network_id ?? 'mainnet';
+  const [network, setNetwork] = useState<NetworkKind | null>(null);
 
   useEffect(() => {
-    commands.networkConfig().then((config) => setConfig(config));
+    commands.getNetwork({}).then((data) => setNetwork(data.kind));
   }, []);
 
   useEffect(() => {
@@ -68,6 +80,23 @@ export function MakeOffer() {
       (state.offered.xch === '0' || !state.offered.xch) &&
       state.offered.cats.length === 0 &&
       state.offered.nfts.length === 1;
+
+    let expiresAtSecond = null;
+    if (state.expiration !== null) {
+      const days = parseInt(state.expiration.days) || 0;
+      const hours = parseInt(state.expiration.hours) || 0;
+      const minutes = parseInt(state.expiration.minutes) || 0;
+      const totalSeconds = days * 24 * 60 * 60 + hours * 60 * 60 + minutes * 60;
+      if (totalSeconds <= 0) {
+        addError({
+          kind: 'invalid',
+          reason: t`Expiration must be at least 1 second in the future`,
+        });
+        setPending(false);
+        return;
+      }
+      expiresAtSecond = Math.ceil(Date.now() / 1000) + totalSeconds;
+    }
 
     const data = await commands.makeOffer({
       offered_assets: {
@@ -96,16 +125,10 @@ export function MakeOffer() {
         (state.fee || '0').toString(),
         walletState.sync.unit.decimals,
       ),
-      expires_at_second:
-        state.expiration === null
-          ? null
-          : Math.ceil(Date.now() / 1000) +
-            Number(state.expiration.days || '0') * 24 * 60 * 60 +
-            Number(state.expiration.hours || '0') * 60 * 60 +
-            Number(state.expiration.minutes || '0') * 60,
+      expires_at_second: expiresAtSecond,
     });
 
-    clearOffer();
+    setState(null);
     setOffer(data.offer);
     setPending(false);
     setCanUploadToMintGarden(mintgardenSupported);
@@ -115,9 +138,9 @@ export function MakeOffer() {
 
   const invalid =
     state.expiration !== null &&
-    (isNaN(Number(state.expiration.days)) ||
-      isNaN(Number(state.expiration.hours)) ||
-      isNaN(Number(state.expiration.minutes)));
+    (parseInt(state.expiration.days) || 0) === 0 &&
+    (parseInt(state.expiration.hours) || 0) === 0 &&
+    (parseInt(state.expiration.minutes) || 0) === 0;
 
   return (
     <>
@@ -141,9 +164,7 @@ export function MakeOffer() {
                 offering
                 prefix='offer'
                 assets={state.offered}
-                setAssets={(assets) =>
-                  useOfferState.setState({ offered: assets })
-                }
+                setAssets={(assets) => setState({ offered: assets })}
               />
             </CardContent>
           </Card>
@@ -163,9 +184,7 @@ export function MakeOffer() {
               <AssetSelector
                 prefix='requested'
                 assets={state.requested}
-                setAssets={(assets) =>
-                  useOfferState.setState({ requested: assets })
-                }
+                setAssets={(assets) => setState({ requested: assets })}
               />
             </CardContent>
           </Card>
@@ -176,15 +195,17 @@ export function MakeOffer() {
                 <Trans>Network Fee</Trans>
               </Label>
               <div className='relative'>
-                <Input
+                <TokenAmountInput
                   id='fee'
                   type='text'
                   placeholder={'0.00'}
                   className='pr-12'
                   value={state.fee}
-                  onChange={(e) =>
-                    useOfferState.setState({ fee: e.target.value })
-                  }
+                  onValueChange={(values) => {
+                    setState({
+                      fee: values.value,
+                    });
+                  }}
                 />
                 <div className='pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3'>
                   <span className='text-gray-500 text-sm' id='price-currency'>
@@ -204,11 +225,15 @@ export function MakeOffer() {
                   checked={state.expiration !== null}
                   onCheckedChange={(value) => {
                     if (value) {
-                      useOfferState.setState({
-                        expiration: { days: '1', hours: '', minutes: '' },
+                      setState({
+                        expiration: {
+                          days: expiry.days.toString(),
+                          hours: expiry.hours.toString(),
+                          minutes: expiry.minutes.toString(),
+                        },
                       });
                     } else {
-                      useOfferState.setState({ expiration: null });
+                      setState({ expiration: null });
                     }
                   }}
                 />
@@ -217,16 +242,17 @@ export function MakeOffer() {
               {state.expiration !== null && (
                 <div className='flex gap-2'>
                   <div className='relative'>
-                    <Input
+                    <IntegerInput
                       className='pr-12'
                       value={state.expiration.days}
                       placeholder='0'
-                      onChange={(e) => {
-                        if (state.expiration === null) return;
-                        useOfferState.setState({
+                      min={0}
+                      onValueChange={(values) => {
+                        if (!state.expiration) return;
+                        setState({
                           expiration: {
                             ...state.expiration,
-                            days: e.target.value,
+                            days: values.value,
                           },
                         });
                       }}
@@ -239,16 +265,17 @@ export function MakeOffer() {
                   </div>
 
                   <div className='relative'>
-                    <Input
+                    <IntegerInput
                       className='pr-12'
                       value={state.expiration.hours}
                       placeholder='0'
-                      onChange={(e) => {
-                        if (state.expiration === null) return;
-                        useOfferState.setState({
+                      min={0}
+                      onValueChange={(values) => {
+                        if (!state.expiration) return;
+                        setState({
                           expiration: {
                             ...state.expiration,
-                            hours: e.target.value,
+                            hours: values.value,
                           },
                         });
                       }}
@@ -261,16 +288,17 @@ export function MakeOffer() {
                   </div>
 
                   <div className='relative'>
-                    <Input
+                    <IntegerInput
                       className='pr-12'
                       value={state.expiration.minutes}
                       placeholder='0'
-                      onChange={(e) => {
-                        if (state.expiration === null) return;
-                        useOfferState.setState({
+                      min={0}
+                      onValueChange={(values) => {
+                        if (!state.expiration) return;
+                        setState({
                           expiration: {
                             ...state.expiration,
-                            minutes: e.target.value,
+                            minutes: values.value,
                           },
                         });
                       }}
@@ -291,7 +319,7 @@ export function MakeOffer() {
           <Button
             variant='outline'
             onClick={() => {
-              clearOffer();
+              setState(null);
               navigate('/offers', { replace: true });
             }}
           >
@@ -318,15 +346,15 @@ export function MakeOffer() {
                   recipient or make it public to be accepted by anyone.
                 </Trans>
                 <CopyBox title='Offer File' value={offer} className='mt-2' />
-                {(network === 'mainnet' || network === 'testnet11') && (
+                {network !== 'unknown' && (
                   <div className='flex flex-col gap-2 mt-2'>
                     <div className='grid grid-cols-2 gap-2'>
                       <Button
                         variant='outline'
                         className='text-neutral-800 dark:text-neutral-200'
                         onClick={() => {
-                          if (dexieLink) return open(dexieLink);
-                          uploadToDexie(offer, network === 'testnet11')
+                          if (dexieLink) return openUrl(dexieLink);
+                          uploadToDexie(offer, network === 'testnet')
                             .then(setDexieLink)
                             .catch((error) =>
                               addError({
@@ -349,8 +377,8 @@ export function MakeOffer() {
                           variant='outline'
                           className='text-neutral-800 dark:text-neutral-200'
                           onClick={() => {
-                            if (mintGardenLink) return open(mintGardenLink);
-                            uploadToMintGarden(offer, network === 'testnet11')
+                            if (mintGardenLink) return openUrl(mintGardenLink);
+                            uploadToMintGarden(offer, network === 'testnet')
                               .then(setMintGardenLink)
                               .catch((error) =>
                                 addError({
@@ -378,7 +406,7 @@ export function MakeOffer() {
             <DialogFooter>
               <Button
                 onClick={() => {
-                  setOffer('');
+                  setState(null);
                   navigate('/offers', { replace: true });
                 }}
               >
@@ -405,7 +433,24 @@ function AssetSelector({
   assets,
   setAssets,
 }: AssetSelectorProps) {
+  const [state] = useOfferStateWithDefault();
   const [includeAmount, setIncludeAmount] = useState(!!assets.xch);
+  const [tokens, setTokens] = useState<CatRecord[]>([]);
+  const { getCatAskPriceInXch } = usePrices();
+
+  useEffect(() => {
+    if (!offering) return;
+    commands
+      .getCats({})
+      .then((data) => setTokens(data.cats))
+      .catch(console.error);
+  }, [offering]);
+
+  const calculateXchEquivalent = (catAmount: number, assetId: string) => {
+    const catPriceInXch = getCatAskPriceInXch(assetId);
+    if (catPriceInXch === null) return '0';
+    return (catAmount * catPriceInXch).toFixed(9);
+  };
 
   return (
     <>
@@ -449,17 +494,51 @@ function AssetSelector({
         <div className='mt-4 flex flex-col space-y-1.5'>
           <Label htmlFor={`${prefix}-amount`}>XCH</Label>
           <div className='flex'>
-            <Input
+            <TokenAmountInput
               id={`${prefix}-amount`}
+              type='text'
               className='rounded-r-none z-10'
               placeholder={t`Enter amount`}
               value={assets.xch}
-              onChange={(e) => setAssets({ ...assets, xch: e.target.value })}
+              onValueChange={(values) => {
+                setAssets({
+                  ...assets,
+                  xch: values.value,
+                });
+              }}
             />
+            {!offering &&
+              state.offered.cats.length === 1 &&
+              state.offered.cats[0].amount && (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant='outline'
+                        size='icon'
+                        className='border-l-0 rounded-none flex-shrink-0'
+                        onClick={() => {
+                          const cat = state.offered.cats[0];
+                          const xchAmount = calculateXchEquivalent(
+                            Number(cat.amount),
+                            cat.asset_id,
+                          );
+                          setAssets({ ...assets, xch: xchAmount });
+                        }}
+                      >
+                        <ArrowUpToLine className='h-4 w-4 rotate-90' />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <Trans>Convert to XCH at current asking price</Trans>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
             <Button
               variant='outline'
               size='icon'
-              className='border-l-0 rounded-l-none flex-shrink-0 flex-grow-0'
+              className='border-l-0 rounded-l-none flex-shrink-0'
               onClick={() => {
                 setAssets({
                   ...assets,
@@ -484,9 +563,9 @@ function AssetSelector({
             <div key={i} className='flex h-14 z-20'>
               {offering === true ? (
                 <NftSelector
-                  value={nft}
+                  value={nft || null}
                   onChange={(nftId) => {
-                    assets.nfts[i] = nftId;
+                    assets.nfts[i] = nftId || '';
                     setAssets({ ...assets });
                   }}
                   disabled={assets.nfts.filter((id) => id !== nft)}
@@ -536,27 +615,58 @@ function AssetSelector({
                   .filter((amount) => amount.asset_id !== cat.asset_id)
                   .map((amount) => amount.asset_id)}
                 className='rounded-r-none'
+                hideZeroBalance={offering === true}
               />
-              <TokenAmountInput
-                id={`${prefix}-cat-${i}-amount`}
-                className='border-l-0 z-10 rounded-l-none rounded-r-none w-[100px] h-12'
-                placeholder={t`Amount`}
-                value={cat.amount}
-                onChange={(e) => {
-                  assets.cats[i].amount = e.target.value;
-                  setAssets({ ...assets });
-                }}
-              />
-              <Button
-                variant='outline'
-                className='border-l-0 rounded-l-none flex-shrink-0 flex-grow-0 h-12 px-3'
-                onClick={() => {
-                  assets.cats.splice(i, 1);
-                  setAssets({ ...assets });
-                }}
-              >
-                <TrashIcon className='h-4 w-4' />
-              </Button>
+              <div className='flex flex-grow-0'>
+                <TokenAmountInput
+                  id={`${prefix}-cat-${i}-amount`}
+                  className='border-l-0 z-10 rounded-l-none rounded-r-none w-[100px] h-12'
+                  placeholder={t`Amount`}
+                  value={cat.amount}
+                  onValueChange={(values) => {
+                    assets.cats[i].amount = values.value;
+                    setAssets({ ...assets });
+                  }}
+                />
+                {offering && (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant='outline'
+                          className='border-l-0 rounded-none h-12 px-2 text-xs'
+                          onClick={() => {
+                            const token = tokens.find(
+                              (t) => t.asset_id === cat.asset_id,
+                            );
+                            if (token) {
+                              assets.cats[i].amount = (
+                                Number(token.balance) / 1000
+                              ).toString();
+                              setAssets({ ...assets });
+                            }
+                          }}
+                        >
+                          <ArrowUpToLine className='h-3 w-3 mr-1' />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <Trans>Use maximum balance</Trans>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+                <Button
+                  variant='outline'
+                  className='border-l-0 rounded-l-none flex-shrink-0 flex-grow-0 h-12 px-3'
+                  onClick={() => {
+                    assets.cats.splice(i, 1);
+                    setAssets({ ...assets });
+                  }}
+                >
+                  <TrashIcon className='h-4 w-4' />
+                </Button>
+              </div>
             </div>
           ))}
         </div>

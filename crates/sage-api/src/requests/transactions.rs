@@ -9,7 +9,7 @@ pub struct SendXch {
     pub amount: Amount,
     pub fee: Amount,
     #[serde(default)]
-    pub memos: Vec<String>,
+    pub memos: Option<Vec<String>>,
     #[serde(default)]
     pub auto_submit: bool,
 }
@@ -27,7 +27,7 @@ pub struct BulkSendXch {
     pub transfers: Vec<Transfer>,
     pub fee: Amount,
     #[serde(default)]
-    pub memos: Vec<String>,
+    pub memos: Option<Vec<String>>,
     #[serde(default)]
     pub auto_submit: bool,
 }
@@ -39,6 +39,24 @@ pub struct CombineXch {
     pub fee: Amount,
     #[serde(default)]
     pub auto_submit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct AutoCombineXch {
+    pub max_coins: u32,
+    pub max_coin_amount: Option<Amount>,
+    pub fee: Amount,
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct AutoCombineXchResponse {
+    pub coin_ids: Vec<String>,
+    pub summary: TransactionSummary,
+    pub coin_spends: Vec<CoinSpendJson>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +76,25 @@ pub struct CombineCat {
     pub fee: Amount,
     #[serde(default)]
     pub auto_submit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct AutoCombineCat {
+    pub asset_id: String,
+    pub max_coins: u32,
+    pub max_coin_amount: Option<Amount>,
+    pub fee: Amount,
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct AutoCombineCatResponse {
+    pub coin_ids: Vec<String>,
+    pub summary: TransactionSummary,
+    pub coin_spends: Vec<CoinSpendJson>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,8 +125,10 @@ pub struct SendCat {
     pub address: String,
     pub amount: Amount,
     pub fee: Amount,
+    #[serde(default = "yes")]
+    pub include_hint: bool,
     #[serde(default)]
-    pub memos: Vec<String>,
+    pub memos: Option<Vec<String>>,
     #[serde(default)]
     pub auto_submit: bool,
 }
@@ -100,10 +139,36 @@ pub struct BulkSendCat {
     pub asset_id: String,
     pub transfers: Vec<Transfer>,
     pub fee: Amount,
+    #[serde(default = "yes")]
+    pub include_hint: bool,
     #[serde(default)]
-    pub memos: Vec<String>,
+    pub memos: Option<Vec<String>>,
     #[serde(default)]
     pub auto_submit: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct MultiSend {
+    pub payments: Vec<Payment>,
+    pub fee: Amount,
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "tauri", derive(specta::Type))]
+pub struct Payment {
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    pub address: String,
+    pub amount: Amount,
+    #[serde(default)]
+    pub memos: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +338,7 @@ pub type SplitCatResponse = TransactionResponse;
 pub type IssueCatResponse = TransactionResponse;
 pub type SendCatResponse = TransactionResponse;
 pub type BulkSendCatResponse = TransactionResponse;
+pub type MultiSendResponse = TransactionResponse;
 pub type CreateDidResponse = TransactionResponse;
 pub type TransferNftsResponse = TransactionResponse;
 pub type AddNftUriResponse = TransactionResponse;
